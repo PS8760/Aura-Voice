@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { classifyIntent } from "@/lib/domain/intent";
 import { initialSessionState } from "@/lib/domain/orchestrator";
-import { orchestrator } from "@/lib/server/engine";
+import { createEngine, createRequestRepository } from "@/lib/server/engine";
 import { classifyWithOllama, localAiEnabled } from "@/lib/server/ollama";
 import { turnRequestSchema } from "@/lib/server/validation";
 
@@ -55,7 +55,10 @@ export async function POST(request: Request) {
   }
 
   try {
-    const result = orchestrator.processTurn(text, base, override);
+    // Stateless execution: replay previously executed mock actions onto a fresh
+    // fixture copy so lookups reflect this session without shared server state.
+    const engine = createEngine(createRequestRepository(base.actions));
+    const result = engine.processTurn(text, base, override);
     return NextResponse.json({ ok: true, aiUsed, result });
   } catch (error) {
     return NextResponse.json(

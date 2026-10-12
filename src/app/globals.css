@@ -1,26 +1,120 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/*
+ * Aura Voice CX design tokens.
+ *
+ * A warm, editorial system: ivory paper surfaces, charcoal ink, and restrained
+ * sage / forest-green accents. Deliberately no neon gradients, glassmorphism
+ * or decorative chrome. Every token has a single, obvious purpose.
+ */
+@theme {
+  --color-ivory: #f3efe5;
+  --color-canvas: #faf8f2;
+  --color-panel: #ffffff;
+  --color-parchment: #efe9dc;
+
+  --color-charcoal: #2c2924;
+  --color-ink: #1a1815;
+  --color-muted: #6d675c;
+  --color-faint: #97907f;
+
+  --color-line: #e5dfd1;
+  --color-line-strong: #d5ccb9;
+
+  --color-sage: #8b9b83;
+  --color-sage-soft: #e7ece1;
+  --color-sage-ink: #566b4e;
+
+  --color-forest: #2e4a3c;
+  --color-forest-deep: #21382c;
+  --color-forest-tint: #dbe7df;
+
+  --color-amber: #946f20;
+  --color-amber-soft: #f2e7cf;
+
+  --color-rust: #9c463b;
+  --color-rust-soft: #f1dcd6;
+
+  --font-display: var(--font-fraunces), Georgia, "Times New Roman", serif;
+  --font-sans: var(--font-inter), system-ui, -apple-system, sans-serif;
+
+  --radius-card: 14px;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+  body {
+    background-color: var(--color-ivory);
+    color: var(--color-charcoal);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-display);
+    font-optical-sizing: auto;
+    color: var(--color-ink);
+    letter-spacing: -0.015em;
+  }
+
+  ::selection {
+    background: var(--color-forest-tint);
+    color: var(--color-forest-deep);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-forest);
+    outline-offset: 2px;
+    border-radius: 3px;
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .paper-grid {
+    background-image:
+      linear-gradient(to right, rgba(46, 74, 60, 0.04) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(46, 74, 60, 0.04) 1px, transparent 1px);
+    background-size: 22px 22px;
+  }
+}
+
+/* Honour the user's motion preference everywhere. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Thin, unobtrusive scrollbars for the conversation and activity panes. */
+.scroll-slim {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}
+.scroll-slim::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scroll-slim::-webkit-scrollbar-thumb {
+  background: var(--color-line-strong);
+  border-radius: 999px;
+}
+.scroll-slim::-webkit-scrollbar-track {
+  background: transparent;
 }

@@ -20,6 +20,15 @@ export const RESOLUTION_STATUSES: readonly ResolutionStatus[] = [
   "OUT_OF_SCOPE",
 ] as const;
 
+export const CALL_MODES = [
+  "browser-voice",
+  "local-ai",
+  "text-fallback",
+  "scenario",
+] as const;
+
+export type CallMode = (typeof CALL_MODES)[number];
+
 export const executedActionSchema = z.object({
   id: z.string(),
   type: z.enum([
@@ -53,7 +62,7 @@ export const callOutcomeSchema = z.object({
   actions_executed: z.array(executedActionSchema),
   unresolved_issues: z.array(z.string()),
   generated_at: z.string(),
-  mode: z.enum(["browser-voice", "local-ai", "text-fallback", "scenario"]),
+  mode: z.enum(CALL_MODES as unknown as [CallMode, ...CallMode[]]),
 });
 
 export type CallOutcome = z.infer<typeof callOutcomeSchema>;
