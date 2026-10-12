@@ -241,6 +241,7 @@ export function useCallSession(): CallSessionApi {
   }, [adapter]);
 
   const resetSession = useCallback(() => {
+    sessionTokenRef.current += 1;
     const fresh = initialSessionState();
     sessionRef.current = fresh;
     setSessionState(fresh);
@@ -288,8 +289,9 @@ export function useCallSession(): CallSessionApi {
   );
 
   const finalizeOutcome = useCallback(async () => {
+    const token = sessionTokenRef.current;
     const response = await requestOutcome(sessionRef.current, modeRef.current);
-    if (!mountedRef.current) return;
+    if (!mountedRef.current || sessionTokenRef.current !== token) return;
     if (response.ok && response.outcome) {
       setOutcome(response.outcome);
       setHistory((prev) => {
@@ -328,6 +330,7 @@ export function useCallSession(): CallSessionApi {
       }
       if (busyRef.current) return;
       busyRef.current = true;
+      const token = sessionTokenRef.current;
 
       // Stop capturing while we think so Aria's own voice is never transcribed.
       adapter.recognizer.abort();
@@ -340,6 +343,7 @@ export function useCallSession(): CallSessionApi {
       try {
         response = await requestTurn(text, sessionRef.current, modeRef.current);
       } catch (error) {
+        if (sessionTokenRef.current !== token) return;
         busyRef.current = false;
         setStatus("error");
         setErrorMessage(
@@ -349,7 +353,9 @@ export function useCallSession(): CallSessionApi {
         return;
       }
 
-      if (!mountedRef.current) {
+      // A turn that resolves after the call ended or a new session began is
+      // dropped so it cannot corrupt the finished call or the next one.
+      if (!mountedRef.current || sessionTokenRef.current !== token) {
         busyRef.current = false;
         return;
       }
@@ -379,12 +385,14 @@ export function useCallSession(): CallSessionApi {
         adapter.synthesizer.speak(result.reply, {
           onEnd: () => {
             busyRef.current = false;
-            if (mountedRef.current) resumeAfterAgent();
+            if (mountedRef.current && sessionTokenRef.current === token) {
+              resumeAfterAgent();
+            }
           },
         });
       } else {
         busyRef.current = false;
-        resumeAfterAgent();
+        if (sessionTokenRef.current === token) resumeAfterAgent();
       }
     },
     [adapter, appendAgentTurn, appendCustomerTurn, resumeAfterAgent],
@@ -519,12 +527,19 @@ export function useCallSession(): CallSessionApi {
     appendAgentTurn(greeting, null, "voice");
     setStatusMessage(greeting);
 
+    const token = sessionTokenRef.current;
     if (speakEnabledRef.current && adapter.synthesizer.isSupported()) {
       setStatus("speaking");
       adapter.synthesizer.speak(greeting, {
         onEnd: () => {
           startingRef.current = false;
-          if (mountedRef.current && activeRef.current) beginListeningRef.current();
+          if (
+            mountedRef.current &&
+            activeRef.current &&
+            sessionTokenRef.current === token
+          ) {
+            beginListeningRef.current();
+          }
         },
       });
     } else {
@@ -534,6 +549,7 @@ export function useCallSession(): CallSessionApi {
   }, [adapter, appendAgentTurn, resetSession]);
 
   const endCall = useCallback(() => {
+    sessionTokenRef.current += 1;
     activeRef.current = false;
     startingRef.current = false;
     busyRef.current = false;
