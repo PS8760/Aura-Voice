@@ -4,11 +4,17 @@ import {
   type SessionState,
   type TurnResult,
 } from "@/lib/domain/orchestrator";
+import { DEFAULT_LOCALE, type Locale } from "@/lib/domain/locale";
 import type { CallMode, CallOutcome } from "@/lib/domain/outcome";
 
 export type InteractionMode = CallMode;
 
 export type TransportSource = "server" | "local";
+
+export interface HistoryTurn {
+  role: "customer" | "agent";
+  text: string;
+}
 
 export interface TurnResponse {
   ok: boolean;
@@ -16,6 +22,13 @@ export interface TurnResponse {
   result?: TurnResult;
   message?: string;
   source: TransportSource;
+  /** Present only when the server used the local-model agent path. */
+  agent?: {
+    steps: number;
+    toolCalls: string[];
+    acceptedDraft: boolean;
+    rejectedDraft?: boolean;
+  };
 }
 
 export interface OutcomeResponse {
@@ -23,6 +36,13 @@ export interface OutcomeResponse {
   outcome?: CallOutcome;
   message?: string;
   source: TransportSource;
+}
+
+export interface AgentMetricsPayload {
+  turns: number;
+  aiTurns: number;
+  acceptedDrafts: number;
+  rejectedDrafts: number;
 }
 
 export interface HealthPayload {
@@ -60,8 +80,8 @@ export function resetLocalEngine(): void {
   localRepo.reset();
 }
 
-export function agentGreeting(): string {
-  return localEngine.greeting();
+export function agentGreeting(locale: Locale = DEFAULT_LOCALE): string {
+  return localEngine.greeting(locale);
 }
 
 async function parseJsonSafe(response: Response): Promise<unknown> {
@@ -76,15 +96,27 @@ export async function requestTurn(
   text: string,
   state: SessionState,
   mode: InteractionMode,
+  locale: Locale = DEFAULT_LOCALE,
+  history: HistoryTurn[] = [],
 ): Promise<TurnResponse> {
   try {
     const response = await fetch("/api/support/turn", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, state, mode }),
+      body: JSON.stringify({ text, state, mode, locale, history }),
     });
     const body = (await parseJsonSafe(response)) as
-      | { ok: true; aiUsed: boolean; result: TurnResult }
+      | {
+          ok: true;
+          aiUsed: boolean;
+          result: TurnResult;
+          agent?: {
+            steps: number;
+            toolCalls: string[];
+            acceptedDraft: boolean;
+            rejectedDraft?: boolean;
+          };
+        }
       | { ok: false; message?: string }
       | null;
 
@@ -93,6 +125,7 @@ export async function requestTurn(
         ok: true,
         aiUsed: body.aiUsed,
         result: body.result,
+        agent: body.agent,
         source: "server",
       };
     }
@@ -101,7 +134,7 @@ export async function requestTurn(
     // Serverless API unreachable or returned an error: use the in-browser
     // deterministic engine. This is a real engine, not a scripted fallback.
     try {
-      const result = localEngine.processTurn(text, state);
+      const result = localEngine.processTurn(text, state, { locale });
       return { ok: true, aiUsed: false, result, source: "local" };
     } catch (error) {
       return {
@@ -120,12 +153,20 @@ export async function requestTurn(
 export async function requestOutcome(
   state: SessionState,
   mode: InteractionMode,
+  locale: Locale = DEFAULT_LOCALE,
+  extras: { lastReply?: string | null; agentMetrics?: AgentMetricsPayload | null } = {},
 ): Promise<OutcomeResponse> {
   try {
     const response = await fetch("/api/support/outcome", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ state, mode }),
+      body: JSON.stringify({
+        state,
+        mode,
+        locale,
+        lastReply: extras.lastReply ?? undefined,
+        agentMetrics: extras.agentMetrics ?? undefined,
+      }),
     });
     const body = (await parseJsonSafe(response)) as
       | { ok: true; outcome: CallOutcome }

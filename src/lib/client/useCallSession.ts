@@ -7,6 +7,7 @@ import {
   type ActivityEvent,
   type SessionState,
 } from "@/lib/domain/orchestrator";
+import { DEFAULT_LOCALE, type Locale } from "@/lib/domain/locale";
 import type { CallOutcome } from "@/lib/domain/outcome";
 import {
   appendTurn,
@@ -28,6 +29,7 @@ import {
   requestOutcome,
   requestTurn,
   resetLocalEngine,
+  type AgentMetricsPayload,
   type HealthPayload,
   type InteractionMode,
 } from "./engineClient";
@@ -73,6 +75,8 @@ export interface CallSessionApi {
   scenarioRunning: boolean;
   activeScenario: Scenario | null;
   elapsedSeconds: number;
+  locale: Locale;
+  setLocale: (locale: Locale) => void;
   getMicLevel: () => number;
   startCall: () => void;
   endCall: () => void;
@@ -109,7 +113,8 @@ function persistHistory(list: CallOutcome[]): void {
   }
 }
 
-export function useCallSession(): CallSessionApi {
+export function useCallSession(options: { initialLocale?: Locale } = {}): CallSessionApi {
+  const initialLocale = options.initialLocale ?? DEFAULT_LOCALE;
   const adapterRef = useRef<VoiceAdapter | null>(null);
   if (!adapterRef.current) adapterRef.current = createBrowserVoiceAdapter();
   const adapter = adapterRef.current;
@@ -142,6 +147,7 @@ export function useCallSession(): CallSessionApi {
   const [activeScenario, setActiveScenario] = useState<Scenario | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [callStartedAt, setCallStartedAt] = useState<number | null>(null);
+  const [locale, setLocaleState] = useState<Locale>(initialLocale);
 
   const statusRef = useRef<CallStatus>("idle");
   const sessionRef = useRef<SessionState>(sessionState);
@@ -153,9 +159,20 @@ export function useCallSession(): CallSessionApi {
   const speakEnabledRef = useRef(true);
   const aiUsedRef = useRef(false);
   const modeRef = useRef<InteractionMode>("text-fallback");
+  const localeRef = useRef<Locale>(initialLocale);
   const meterRef = useRef<MicLevelMeter | null>(null);
   const beginListeningRef = useRef<() => void>(() => {});
   const mountedRef = useRef(true);
+  // Client-observed agent behaviour, persisted with the session. This is
+  // intentionally coarse: it records what actually happened, not a metric that
+  // could be gamed.
+  const metricsRef = useRef<AgentMetricsPayload>({
+    turns: 0,
+    aiTurns: 0,
+    acceptedDrafts: 0,
+    rejectedDrafts: 0,
+  });
+  const lastReplyRef = useRef<string | null>(null);
   // Incremented whenever a session starts or ends so in-flight turns and
   // speech callbacks from a previous session are discarded instead of
   // overwriting the current call state.
@@ -168,6 +185,10 @@ export function useCallSession(): CallSessionApi {
   useEffect(() => {
     speakEnabledRef.current = speakEnabled;
   }, [speakEnabled]);
+
+  useEffect(() => {
+    localeRef.current = locale;
+  }, [locale]);
 
   const interactionMode: InteractionMode = capabilities.recognition
     ? "browser-voice"
@@ -253,6 +274,8 @@ export function useCallSession(): CallSessionApi {
     aiUsedRef.current = false;
     setErrorMessage(null);
     setErrorRecoverable(false);
+    metricsRef.current = { turns: 0, aiTurns: 0, acceptedDrafts: 0, rejectedDrafts: 0 };
+    lastReplyRef.current = null;
   }, []);
 
   const appendCustomerTurn = useCallback(
@@ -290,7 +313,12 @@ export function useCallSession(): CallSessionApi {
 
   const finalizeOutcome = useCallback(async () => {
     const token = sessionTokenRef.current;
-    const response = await requestOutcome(sessionRef.current, modeRef.current);
+    const response = await requestOutcome(
+      sessionRef.current,
+      modeRef.current,
+      localeRef.current,
+      { lastReply: lastReplyRef.current, agentMetrics: metricsRef.current },
+    );
     if (!mountedRef.current || sessionTokenRef.current !== token) return;
     if (response.ok && response.outcome) {
       setOutcome(response.outcome);
@@ -339,9 +367,27 @@ export function useCallSession(): CallSessionApi {
       setStatus("thinking");
       setStatusMessage("Checking that for you…");
 
+      // Replay a short window of prior turns because the turn API is stateless.
+      // Exclude the customer turn we just appended; the model receives the
+      // current message separately.
+      const priorTurns = transcriptRef.current
+        .filter((turn) => turn.speaker === "customer" || turn.speaker === "agent")
+        .slice(0, -1)
+        .slice(-8)
+        .map((turn) => ({
+          role: turn.speaker === "customer" ? ("customer" as const) : ("agent" as const),
+          text: turn.text,
+        }));
+
       let response;
       try {
-        response = await requestTurn(text, sessionRef.current, modeRef.current);
+        response = await requestTurn(
+          text,
+          sessionRef.current,
+          modeRef.current,
+          localeRef.current,
+          priorTurns,
+        );
       } catch (error) {
         if (sessionTokenRef.current !== token) return;
         busyRef.current = false;
@@ -379,6 +425,16 @@ export function useCallSession(): CallSessionApi {
       setActivity((prev) => [...prev, ...result.events]);
       appendAgentTurn(result.reply, result.intent, source);
       setStatusMessage(result.reply);
+
+      // Record observed agent behaviour for this turn.
+      const metrics = metricsRef.current;
+      metrics.turns += 1;
+      if (response.aiUsed) {
+        metrics.aiTurns += 1;
+        if (response.agent?.acceptedDraft) metrics.acceptedDrafts += 1;
+        else if (response.agent?.rejectedDraft) metrics.rejectedDrafts += 1;
+      }
+      lastReplyRef.current = result.reply;
 
       if (options.speak && speakEnabledRef.current && adapter.synthesizer.isSupported()) {
         setStatus("speaking");
@@ -523,7 +579,7 @@ export function useCallSession(): CallSessionApi {
       return;
     }
 
-    const greeting = agentGreeting();
+    const greeting = agentGreeting(localeRef.current);
     appendAgentTurn(greeting, null, "voice");
     setStatusMessage(greeting);
 
@@ -620,7 +676,12 @@ export function useCallSession(): CallSessionApi {
         if (!mountedRef.current) return;
       }
 
-      const response = await requestOutcome(sessionRef.current, "scenario");
+      const response = await requestOutcome(
+        sessionRef.current,
+        "scenario",
+        localeRef.current,
+        { lastReply: lastReplyRef.current, agentMetrics: metricsRef.current },
+      );
       if (!mountedRef.current) return;
       if (response.ok && response.outcome) {
         setOutcome(response.outcome);
@@ -646,6 +707,11 @@ export function useCallSession(): CallSessionApi {
 
   const setSpeakEnabled = useCallback((value: boolean) => {
     setSpeakEnabledState(value);
+  }, []);
+
+  const setLocale = useCallback((next: Locale) => {
+    localeRef.current = next;
+    setLocaleState(next);
   }, []);
 
   const clearHistory = useCallback(() => {
@@ -691,6 +757,8 @@ export function useCallSession(): CallSessionApi {
       scenarioRunning,
       activeScenario,
       elapsedSeconds,
+      locale,
+      setLocale,
       getMicLevel,
       startCall: () => void startCall(),
       endCall,
@@ -724,6 +792,8 @@ export function useCallSession(): CallSessionApi {
       scenarioRunning,
       activeScenario,
       elapsedSeconds,
+      locale,
+      setLocale,
       getMicLevel,
       startCall,
       endCall,

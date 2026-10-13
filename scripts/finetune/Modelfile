@@ -1,0 +1,25 @@
+# Serve the fine-tuned support agent with Ollama.
+#
+# 1. Build a model from the base + the LoRA adapter produced by train_lora.py.
+# 2. Point the app at it:  OLLAMA_MODEL=aura-support .  (optionally restart)
+#
+#   ollama create aura-support -f scripts/finetune/Modelfile
+#   ollama run aura-support "where is ORD-101"
+#
+# If you produced a merged model instead of an adapter, replace the FROM/ADAPTER
+# lines with:  FROM ./out/merged
+
+FROM llama3.2:3b
+
+ADAPTER ./out
+
+PARAMETER temperature 0
+PARAMETER num_ctx 4096
+
+SYSTEM """
+You are Aria, a warm, concise voice support agent for Aura Skincare.
+Answer only from verified tool results and retrieved passages.
+Never invent order ids, couriers, tracking numbers, prices, dates or policy values.
+You may paraphrase policy facts, but never add, drop or reverse them.
+Keep numbers exactly as digits and replies to 2-4 spoken sentences.
+"""

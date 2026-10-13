@@ -1,15 +1,23 @@
 import { NextResponse } from "next/server";
-import { classifyIntent } from "@/lib/domain/intent";
 import { initialSessionState } from "@/lib/domain/orchestrator";
+import { classifyIntent } from "@/lib/domain/intent";
+import { toLocale } from "@/lib/domain/locale";
+import { runSupportAgent } from "@/lib/server/agent";
+import { getRepositories } from "@/lib/server/db/repositories";
 import { createEngine, createRequestRepository } from "@/lib/server/engine";
-import { classifyWithOllama, localAiEnabled } from "@/lib/server/ollama";
+import { DEFAULT_COMPANY_ID, retrievePassages } from "@/lib/server/rag";
+import type { RetrievedPassage } from "@/lib/server/rag";
 import { turnRequestSchema } from "@/lib/server/validation";
 
 export const dynamic = "force-dynamic";
 
 /**
- * Server-side turn endpoint: intent recognition, tool execution, policy
- * enforcement and response construction all happen here.
+ * Server-side turn endpoint.
+ *
+ * Preferred path: the enterprise agent (local model for understanding, code for
+ * every decision). If no local model is reachable, or the agent fails its
+ * guardrails, we fall back to the pure deterministic engine so a turn is always
+ * answered honestly.
  */
 export async function POST(request: Request) {
   let body: unknown;
@@ -35,31 +43,76 @@ export async function POST(request: Request) {
     );
   }
 
-  const { text, state } = parsed.data;
+  const { text, state, locale: rawLocale, history } = parsed.data;
+  const locale = toLocale(rawLocale);
   const base = state ?? initialSessionState();
-
-  let aiUsed = false;
-  let override: { intent: ReturnType<typeof classifyIntent>["intent"] } | undefined;
-
-  // Optional local-AI assist: only for utterances the deterministic classifier
-  // could not place, and only to propose an intent. Policy stays in code.
-  if (localAiEnabled()) {
-    const classification = classifyIntent(text);
-    if (classification.intent === "UNKNOWN" && !classification.needsClarification) {
-      const proposed = await classifyWithOllama(text);
-      if (proposed && proposed !== "UNKNOWN") {
-        aiUsed = true;
-        override = { intent: proposed };
-      }
-    }
-  }
 
   try {
     // Stateless execution: replay previously executed mock actions onto a fresh
     // fixture copy so lookups reflect this session without shared server state.
+    const repo = createRequestRepository(base.actions);
+
+    // Retrieve grounded context for this utterance (best-effort):
+    //  - `knowledge`: approved Q/A answers injected into the agent prompt.
+    //  - `passages`: hybrid-retrieved, cited passages from the tenant knowledge
+    //    base (policy + FAQ + approved knowledge), used by the RAG path.
+    // Both are boosted toward the detected intent and the active locale.
+    let knowledge: { question: string; answer: string }[] = [];
+    let passages: RetrievedPassage[] = [];
+    try {
+      const stores = await getRepositories();
+      const intent = classifyIntent(text).intent;
+      const [entries, approved] = await Promise.all([
+        stores.knowledge.search(text, { intent, locale }),
+        stores.knowledge.list({ approvedOnly: true }),
+      ]);
+      knowledge = entries.map((entry) => ({ question: entry.question, answer: entry.answer }));
+      for (const entry of entries) void stores.knowledge.incrementUsage(entry.id);
+      passages = await retrievePassages(text, {
+        intent,
+        locale,
+        companyId: DEFAULT_COMPANY_ID,
+        knowledge: approved,
+      });
+    } catch {
+      knowledge = [];
+      passages = [];
+    }
+
+    const agent = await runSupportAgent({
+      text,
+      state: base,
+      repo,
+      locale,
+      knowledge,
+      passages,
+      history,
+    });
+    if (agent) {
+      return NextResponse.json({
+        ok: true,
+        aiUsed: true,
+        result: agent.result,
+        agent: {
+          steps: agent.metrics.steps,
+          toolCalls: agent.metrics.toolCalls,
+          acceptedDraft: agent.metrics.acceptedDraft,
+          rejectedDraft: agent.metrics.rejectedDraft,
+          understanding: agent.metrics.understanding,
+          citations: agent.metrics.citations,
+        },
+        passages: passages.map((p) => ({
+          id: p.id,
+          title: p.title,
+          source: p.source,
+          score: Number(p.score.toFixed(4)),
+        })),
+      });
+    }
+
     const engine = createEngine(createRequestRepository(base.actions));
-    const result = engine.processTurn(text, base, override);
-    return NextResponse.json({ ok: true, aiUsed, result });
+    const result = engine.processTurn(text, base, { locale });
+    return NextResponse.json({ ok: true, aiUsed: false, result });
   } catch (error) {
     return NextResponse.json(
       {

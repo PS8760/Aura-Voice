@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallSession } from "@/lib/client/useCallSession";
+import type { SessionUser } from "@/lib/client/user";
+import type { Locale } from "@/lib/domain/locale";
 import { Header } from "./Header";
 import { VoiceWorkspace } from "./VoiceWorkspace";
 import { ScenarioLauncher } from "./ScenarioLauncher";
@@ -10,16 +12,25 @@ import { ActivityTimeline } from "./ActivityTimeline";
 import { PostCallPanel } from "./PostCallPanel";
 import { HistoryPanel } from "./HistoryPanel";
 
-export function Workspace() {
-  const session = useCallSession();
+export function Workspace({
+  user,
+  initialLocale,
+}: {
+  user: SessionUser | null;
+  initialLocale?: Locale;
+}) {
+  const session = useCallSession({ initialLocale });
 
   return (
     <div className="min-h-screen bg-ivory">
       <Header
+        user={user}
         mounted={session.mounted}
         interactionMode={session.interactionMode}
         serverStatus={session.serverStatus}
         localAIAvailable={session.localAIAvailable}
+        locale={session.locale}
+        onLocaleChange={session.setLocale}
       />
 
       <main className="mx-auto max-w-[1240px] px-4 py-6 sm:px-6">

@@ -1,12 +1,17 @@
 import { classifyIntent, extractOrderId } from "./intent";
 import type { OrderRepository } from "./orders";
 import {
+  POLICY_COD_LIMIT,
+  POLICY_DAMAGE_REPORT_WINDOW_HOURS,
+  POLICY_RETURN_WINDOW_DAYS,
   evaluateCancellation,
   evaluateCod,
   evaluateDamagedProduct,
   evaluateReturn,
   evaluateShipping,
 } from "./policy";
+import { policyReplyKey, t } from "./messages";
+import { DEFAULT_LOCALE, type Locale } from "./locale";
 import { ToolExecutor, type ToolCallRecord } from "./tools";
 import type { CallOutcome } from "./outcome";
 import { buildOutcome, type ExecutedAction } from "./outcome";
@@ -75,6 +80,38 @@ export interface TurnResult {
   executed: boolean;
 }
 
+/** Lightweight, deterministic reading of the customer's tone. */
+export type Sentiment = "neutral" | "frustrated" | "confused";
+
+const FRUSTRATED_PATTERNS: RegExp[] = [
+  /\b(?:angry|furious|annoyed|frustrat\w*|ridiculous|unacceptable|terrible|awful|worst)\b/i,
+  /\b(?:still|again|twice|three times)\b/i,
+  /\b(?:useless|waste of time|sick of)\b/i,
+  /!{2,}/,
+  /(?:नाराज़|गुस्सा|परेशान|बकवास|बेकार|फिर भी|अभी तक)/,
+  /(?:বিরক্ত|রাগ|অবিশ্বাস্য|আবারও|এখনও)/,
+  /(?:கோபம்|எரிச்சல்|மீண்டும்|இன்னும்)/,
+  /(?:राग|त्रास|पुन्हा|अजूनही)/,
+];
+
+const CONFUSED_PATTERNS: RegExp[] = [
+  /\b(?:confus\w*|not sure|don'?t understand|unclear|which one|what do you mean)\b/i,
+  /\?{2,}/,
+  /(?:समझ नहीं|उलझन|कौन सा)/,
+  /(?:বুঝতে পারছি না|দ্বিধা)/,
+  /(?:புரியவில்லை|குழப்பம்)/,
+  /(?:समजत नाही|गोंधळ)/,
+];
+
+/** Infer the customer's tone from the utterance alone. Never stores anything. */
+export function detectSentiment(rawText: string): Sentiment {
+  const text = rawText.trim();
+  if (!text) return "neutral";
+  if (FRUSTRATED_PATTERNS.some((pattern) => pattern.test(text))) return "frustrated";
+  if (CONFUSED_PATTERNS.some((pattern) => pattern.test(text))) return "confused";
+  return "neutral";
+}
+
 let eventCounter = 0;
 
 /**
@@ -113,12 +150,8 @@ export class ConversationOrchestrator {
   }
 
   /** The spoken opening line, produced without any user input. */
-  greeting(): string {
-    return (
-      "Thank you for calling Aura Skincare support. This is Aria. I can help " +
-      "you track an order, request a cancellation or a return, check shipping " +
-      "or Cash on Delivery, or report a damaged product. How can I help you today?"
-    );
+  greeting(locale: Locale = DEFAULT_LOCALE): string {
+    return t(locale, "greeting");
   }
 
   processTurn(
@@ -129,8 +162,15 @@ export class ConversationOrchestrator {
      * a local model may *propose* an intent, but this orchestrator still
      * enforces every policy decision in code.
      */
-    override?: { intent?: Intent; needsClarification?: ClarificationKind | null },
+    override?: {
+      intent?: Intent;
+      needsClarification?: ClarificationKind | null;
+      locale?: Locale;
+      sentiment?: Sentiment;
+    },
   ): TurnResult {
+    const locale: Locale = override?.locale ?? DEFAULT_LOCALE;
+    const sentiment: Sentiment = override?.sentiment ?? detectSentiment(text);
     const events: ActivityEvent[] = [];
     const toolCalls: ToolCallRecord[] = [];
     const next: SessionState = {
@@ -141,9 +181,13 @@ export class ConversationOrchestrator {
     };
 
     const classification = classifyIntent(text);
-    const intent = override?.intent ?? classification.intent;
     const needsClarification =
       override?.needsClarification ?? classification.needsClarification;
+    // Ambiguity means we must not run any action: route to the clarifying path.
+    const intent =
+      needsClarification === "order_action"
+        ? "UNKNOWN"
+        : override?.intent ?? classification.intent;
 
     // Resolve the order id for this turn, preferring a fresh mention.
     const mentioned = classification.orderId ?? extractOrderId(text);
@@ -176,7 +220,7 @@ export class ConversationOrchestrator {
     let recordedIntent = intent;
 
     const askForOrderId = (lead: string): void => {
-      reply = `${lead} Could you share the order id, for example ORD-101?`;
+      reply = `${lead} ${t(locale, "askSuffix")}`;
       pending = "order_id";
       resolution = "UNRESOLVED";
       next.pending = "order_id";
@@ -195,10 +239,7 @@ export class ConversationOrchestrator {
     };
 
     const handleUnknownOrder = (): void => {
-      reply =
-        `I could not find an order with that id in our records. This demo ` +
-        `only includes ORD-101, ORD-102 and ORD-103. Could you double-check ` +
-        `and share the correct order id?`;
+      reply = t(locale, "orderUnknown");
       pending = "verify_order_id";
       resolution = "UNRESOLVED";
       next.pending = "verify_order_id";
@@ -218,7 +259,7 @@ export class ConversationOrchestrator {
     switch (intent) {
       case "CANCELLATION_REQUEST": {
         if (!orderId) {
-          askForOrderId("I can help with a cancellation.");
+          askForOrderId(t(locale, "leadCancel"));
           break;
         }
         const lookup = this.tools.lookupOrder(orderId);
@@ -234,7 +275,7 @@ export class ConversationOrchestrator {
           (a) => a.type === "CANCELLATION" && a.orderId === order.id && a.status === "executed",
         );
         if (alreadyCancelled) {
-          reply = `ORD-${order.id.split("-")[1]} has already been cancelled in this session, so no further action is needed.`;
+          reply = t(locale, "cancelAlready", { orderId: order.id });
           resolution = "RESOLVED";
           events.push(
             this.event("result_returned", "Duplicate action ignored", "Cancellation was already executed for this order.", "warn"),
@@ -260,10 +301,7 @@ export class ConversationOrchestrator {
               detail: "Order cancelled while in Processing.",
               at: this.now().toISOString(),
             });
-            reply =
-              `Good news — ${order.id} was still Processing, so I have ` +
-              `cancelled it successfully. You will not be charged for it. ` +
-              `Is there anything else I can help with?`;
+            reply = t(locale, "cancelOk", { orderId: order.id });
             resolution = "RESOLVED";
             summary =
               `Customer asked to cancel ${order.id}. The order was in Processing, ` +
@@ -272,10 +310,7 @@ export class ConversationOrchestrator {
               this.event("result_returned", "Cancellation completed", `${order.id} status set to Cancelled.`, "ok"),
             );
           } else {
-            reply =
-              `I was unable to complete the cancellation for ${order.id} just ` +
-              `now. I will not claim it succeeded. Please try again or I can ` +
-              `escalate this to the support team.`;
+            reply = t(locale, "cancelFail", { orderId: order.id });
             resolution = "ESCALATION_REQUIRED";
             if (!next.unresolved.includes("Mock cancellation operation failed.")) {
               next.unresolved.push("Mock cancellation operation failed.");
@@ -285,7 +320,15 @@ export class ConversationOrchestrator {
             );
           }
         } else {
-          reply = decision.detail;
+          const doorstep =
+            order.status === "Shipped" || order.status === "Out for Delivery";
+          const key = policyReplyKey({
+            kind: "cancellation",
+            status: decision.status,
+            rule: decision.rule,
+            doorstep,
+          });
+          reply = key ? t(locale, key, { status: order.status }) : decision.detail;
           policyExplanation = decision.detail;
           resolution = "UNRESOLVED";
           summary =
@@ -311,10 +354,7 @@ export class ConversationOrchestrator {
 
       case "RETURN_REQUEST": {
         if (!orderId) {
-          reply =
-            "I can help with a return. Returns are accepted within seven days " +
-            "of delivery, provided the product is unopened and in its original " +
-            "packaging. Could you share the order id so I can check it?";
+          reply = t(locale, "returnNeedOrder");
           pending = "order_id";
           resolution = "UNRESOLVED";
           next.pending = "order_id";
@@ -347,14 +387,21 @@ export class ConversationOrchestrator {
             detail: "Return request logged within policy window.",
             at: this.now().toISOString(),
           });
-          reply =
-            `${order.id} is within the seven-day return window, so I have ` +
-            `logged a return request. Please keep the product unopened and in ` +
-            `its original packaging. Is there anything else I can help with?`;
+          reply = t(locale, "returnOk", { orderId: order.id });
           resolution = "RESOLVED";
           summary = `Customer requested a return for ${order.id}. The order is within the seven-day window, so a return request was logged.`;
         } else {
-          reply = decision.detail;
+          const key = policyReplyKey({
+            kind: "return",
+            status: decision.status,
+            rule: decision.rule,
+          });
+          reply = key
+            ? t(locale, key, {
+                window: POLICY_RETURN_WINDOW_DAYS,
+                days: order.deliveredDaysAgo ?? 0,
+              })
+            : decision.detail;
           policyExplanation = decision.detail;
           resolution = "UNRESOLVED";
           summary =
@@ -378,9 +425,7 @@ export class ConversationOrchestrator {
 
       case "DAMAGED_PRODUCT": {
         if (!orderId) {
-          askForOrderId(
-            "I am sorry to hear about a damaged or defective product. Damage must be reported within 48 hours of delivery with photos.",
-          );
+          askForOrderId(t(locale, "leadDamage"));
           break;
         }
         const lookup = this.tools.lookupOrder(orderId);
@@ -404,7 +449,17 @@ export class ConversationOrchestrator {
           this.event("policy_checked", "Damaged-product policy checked", decision.detail, decision.status === "allowed" ? "ok" : "warn"),
         );
         policyExplanation = decision.status === "allowed" ? null : decision.detail;
-        reply = decision.detail;
+        const damageKey = policyReplyKey({
+          kind: "damage",
+          status: decision.status,
+          rule: decision.rule,
+        });
+        reply = damageKey
+          ? t(locale, damageKey, {
+              window: POLICY_DAMAGE_REPORT_WINDOW_HOURS,
+              hours: (order.deliveredDaysAgo ?? 0) * 24,
+            })
+          : decision.detail;
         resolution =
           decision.status === "allowed" ? "RESOLVED" : decision.status === "denied" ? "UNRESOLVED" : "UNRESOLVED";
         if (decision.status === "allowed") {
@@ -443,7 +498,13 @@ export class ConversationOrchestrator {
           if (lookup.result.ok && lookup.result.data) {
             const decision = evaluateCod(lookup.result.data.value);
             events.push(this.event("policy_checked", "COD policy checked", decision.detail, decision.status === "allowed" ? "ok" : "warn"));
-            reply = decision.detail;
+            const codKey = policyReplyKey({ kind: "cod", status: decision.status, rule: decision.rule });
+            reply = codKey
+              ? t(locale, codKey, {
+                  limit: POLICY_COD_LIMIT.toLocaleString("en-IN"),
+                  value: lookup.result.data.value.toLocaleString("en-IN"),
+                })
+              : decision.detail;
             resolution = "RESOLVED";
             summary = `Customer asked about Cash on Delivery for ${lookup.result.data.id}. ${decision.detail}`;
             next.actions.push({
@@ -458,10 +519,7 @@ export class ConversationOrchestrator {
             break;
           }
         }
-        reply =
-          "Cash on Delivery is available for orders up to ₹2,500, and you can " +
-          "pay by cash or UPI at the doorstep. If you share an order id, I can " +
-          "confirm whether it is available for that specific order.";
+        reply = t(locale, "codGeneral");
         resolution = "RESOLVED";
         summary = "Customer asked about Cash on Delivery. General COD policy shared.";
         events.push(this.event("policy_checked", "COD policy explained", "COD up to ₹2,500 by cash or UPI at doorstep.", "ok"));
@@ -474,9 +532,17 @@ export class ConversationOrchestrator {
           toolCalls.push(lookup.call);
           events.push(this.event("order_service_queried", "Order service queried", lookup.call.summary, lookup.result.ok ? "ok" : "error"));
           if (lookup.result.ok && lookup.result.data) {
-            const quote = evaluateShipping(lookup.result.data.value);
-            events.push(this.event("policy_checked", "Shipping policy checked", quote.detail, quote.status === "boundary" ? "warn" : "ok"));
+          const quote = evaluateShipping(lookup.result.data.value);
+          events.push(this.event("policy_checked", "Shipping policy checked", quote.detail, quote.status === "allowed" ? "ok" : "warn"));
+          if (quote.status === "boundary") {
+            reply = t(locale, "shippingBoundary");
+          } else if (quote.status === "allowed" && quote.freeDelivery === true) {
+            reply = t(locale, "shippingFree");
+          } else if (quote.status === "allowed" && quote.freeDelivery === false) {
+            reply = t(locale, "shippingBelow");
+          } else {
             reply = quote.detail;
+          }
             resolution = "RESOLVED";
             policyExplanation = quote.status === "boundary" ? quote.detail : null;
             summary = `Customer asked about shipping for ${lookup.result.data.id}. ${quote.detail}`;
@@ -496,12 +562,7 @@ export class ConversationOrchestrator {
             break;
           }
         }
-        reply =
-          "Orders above ₹499 qualify for free standard delivery, and orders " +
-          "below ₹499 have a ₹50 shipping fee. Standard delivery takes three to " +
-          "five business days. For an order of exactly ₹499, the supplied " +
-          "policy does not specify the fee, so I would confirm that rather than " +
-          "guess.";
+        reply = t(locale, "shippingGeneral");
         resolution = "RESOLVED";
         summary = "Customer asked about shipping charges. General shipping policy shared, including the unresolved exactly-₹499 boundary.";
         events.push(this.event("policy_checked", "Shipping policy explained", "Free above ₹499, ₹50 below ₹499, 3–5 business days; ₹499 boundary unresolved.", "ok"));
@@ -510,7 +571,7 @@ export class ConversationOrchestrator {
 
       case "ORDER_TRACKING": {
         if (!orderId) {
-          askForOrderId("I can track that for you.");
+          askForOrderId(t(locale, "leadTrack"));
           break;
         }
         const lookup = this.tools.lookupOrder(orderId);
@@ -523,21 +584,26 @@ export class ConversationOrchestrator {
         const order = lookup.result.data;
         const parts: string[] = [];
         parts.push(
-          `${order.id} for ${order.customerName} is currently "${order.status}".`,
+          t(locale, "trackingStatus", {
+            orderId: order.id,
+            customerName: order.customerName,
+            status: order.status,
+          }),
         );
         if (order.courier && order.trackingRef) {
           parts.push(
-            `It is with ${order.courier}, tracking reference ${order.trackingRef}.`,
+            t(locale, "trackingCourier", {
+              courier: order.courier,
+              ref: order.trackingRef,
+            }),
           );
         } else {
-          parts.push(
-            "No courier or tracking reference has been supplied for this order yet.",
-          );
+          parts.push(t(locale, "trackingNoCourier"));
           const note = "No courier or tracking data was supplied for this order.";
           if (!next.unresolved.includes(note)) next.unresolved.push(note);
         }
-        parts.push(`Note: ${order.supplierNote}.`);
-        parts.push("This is mock data, not live logistics.");
+        parts.push(t(locale, "trackingNote", { note: order.supplierNote }));
+        parts.push(t(locale, "trackingMock"));
         reply = parts.join(" ");
         resolution = "RESOLVED";
         summary =
@@ -557,12 +623,7 @@ export class ConversationOrchestrator {
       }
 
       case "GENERAL_PRODUCT_QUERY": {
-        reply =
-          "That is a good question, but this demo does not include a product " +
-          "catalogue, so I cannot confirm ingredient or usage details without " +
-          "risk of giving you the wrong information. I can help with order " +
-          "tracking, cancellations, returns, shipping, Cash on Delivery, and " +
-          "damaged products. I can flag your product question for a specialist.";
+        reply = t(locale, "productDeclined");
         resolution = "ESCALATION_REQUIRED";
         recordedIntent = "GENERAL_PRODUCT_QUERY";
         if (!next.unresolved.includes("Product catalogue details requested but unavailable in this demo.")) {
@@ -583,11 +644,7 @@ export class ConversationOrchestrator {
       }
 
       case "OUT_OF_SCOPE": {
-        reply =
-          "I am only able to help with Aura Skincare orders and support — " +
-          "things like tracking, cancellations, returns, shipping, Cash on " +
-          "Delivery, and damaged products. I am not able to help with that, " +
-          "but I am happy to assist with anything Aura related.";
+        reply = t(locale, "outOfScope");
         resolution = "OUT_OF_SCOPE";
         summary = "Customer asked something outside Aura Skincare support; politely declined.";
         events.push(this.event("out_of_scope", "Request out of scope", "Politely declined a non-Aura request.", "warn"));
@@ -597,12 +654,12 @@ export class ConversationOrchestrator {
       case "UNKNOWN":
       default: {
         const lc = text.toLowerCase().trim();
-        const isGreeting = /^(hi|hello|hey|namaste|good (morning|afternoon|evening))\b/.test(lc);
+        const isGreeting =
+          /^(hi|hello|hey|namaste|good (morning|afternoon|evening))\b/.test(lc) ||
+          /(नमस्ते|नमस्कार|হ্যালো|নমস্কার|வணக்கம்)/.test(text);
 
         if (needsClarification === "order_action") {
-          reply =
-            "I can help with your order. Would you like to track it, cancel it, " +
-            "or ask about returning it?";
+          reply = t(locale, "clarifyOrderAction");
           pending = "order_action";
           resolution = "UNRESOLVED";
           summary = "Customer referred to their order without a clear action; Aria asked whether they want to track, cancel or return.";
@@ -611,19 +668,13 @@ export class ConversationOrchestrator {
         }
 
         if (isGreeting) {
-          reply =
-            "Hello, and thank you for contacting Aura Skincare. I can help with " +
-            "order tracking, cancellations, returns, shipping, Cash on Delivery, " +
-            "or a damaged product. What would you like to do?";
+          reply = t(locale, "unknownGreeting");
           resolution = "UNRESOLVED";
           summary = "Customer greeted Aria; Aria offered the supported help topics.";
           break;
         }
 
-        reply =
-          "I am not sure I understood that. Could you rephrase it? I can help " +
-          "with order tracking, cancellations, returns, shipping, Cash on " +
-          "Delivery, and damaged products.";
+        reply = t(locale, "unknownRephrase");
         resolution = "UNRESOLVED";
         summary = "Aria could not confidently classify the request and asked the customer to rephrase.";
         events.push(this.event("clarification_requested", "Clarifying question", "Asked customer to rephrase.", "warn"));
@@ -633,6 +684,15 @@ export class ConversationOrchestrator {
 
     if (!summary) {
       summary = next.lastSummary ?? "No summary available.";
+    }
+
+    // Tone-aware framing. Empathy is added only when the outcome was not a clean
+    // resolution, so a calm, successful answer stays concise. The policy text
+    // itself is never altered — the prefix is purely conversational.
+    if (sentiment === "frustrated" && resolution !== "RESOLVED" && intent !== "OUT_OF_SCOPE") {
+      reply = `${t(locale, "empathyFrustrated")} ${reply}`;
+    } else if (sentiment === "confused" && resolution === "UNRESOLVED" && pending) {
+      reply = `${t(locale, "empathyConfused")} ${reply}`;
     }
 
     next.intent = recordedIntent;

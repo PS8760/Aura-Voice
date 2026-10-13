@@ -2,6 +2,10 @@ import { Leaf, Mic, ShieldCheck, Sparkles, Type } from "lucide-react";
 
 import type { InteractionMode } from "@/lib/client/engineClient";
 import type { ServerStatus } from "@/lib/client/useCallSession";
+import type { SessionUser } from "@/lib/client/user";
+import type { Locale } from "@/lib/domain/locale";
+import { AccountMenu } from "./AccountMenu";
+import { LanguageSelector } from "./LanguageSelector";
 import { Badge, StatusDot } from "./ui";
 
 function serviceTone(status: ServerStatus): {
@@ -20,15 +24,21 @@ function serviceTone(status: ServerStatus): {
 }
 
 export function Header({
+  user,
   mounted,
   interactionMode,
   serverStatus,
   localAIAvailable,
+  locale,
+  onLocaleChange,
 }: {
+  user: SessionUser | null;
   mounted: boolean;
   interactionMode: InteractionMode;
   serverStatus: ServerStatus;
   localAIAvailable: boolean;
+  locale: Locale;
+  onLocaleChange: (locale: Locale) => void;
 }) {
   const service = serviceTone(serverStatus);
   const modeLabel = !mounted
@@ -77,6 +87,7 @@ export function Header({
               <Sparkles size={12} aria-hidden /> Local AI available
             </Badge>
           ) : null}
+          <LanguageSelector locale={locale} onLocaleChange={onLocaleChange} />
           <span
             className="inline-flex items-center gap-2 rounded-full border border-line bg-panel px-2.5 py-1 text-[11px] font-medium text-muted"
             role="status"
@@ -85,6 +96,7 @@ export function Header({
             <StatusDot tone={service.tone} pulse={service.pulse} />
             {service.label}
           </span>
+          <AccountMenu user={user} />
         </div>
       </div>
     </header>

@@ -52,4 +52,11 @@ describe("classifyIntent", () => {
     expect(result.intent).toBe("CANCELLATION_REQUEST");
     expect(result.orderId).toBe("ORD-103");
   });
+
+  it("classifies multilingual requests", () => {
+    expect(classifyIntent("ORD-101 कहाँ है").intent).toBe("ORDER_TRACKING");
+    expect(classifyIntent("मेरा ऑर्डर कैंसिल कर दो").intent).toBe("CANCELLATION_REQUEST");
+    expect(classifyIntent("ORD-102 ফেরত দিতে চাই").intent).toBe("RETURN_REQUEST");
+    expect(classifyIntent("ஆர்டர் எங்கே").intent).toBe("ORDER_TRACKING");
+  });
 });
