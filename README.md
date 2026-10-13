@@ -244,12 +244,64 @@ safe default for a public deployment.
 - **The loop** — after an unresolved or escalated call, the outcome route creates
   a **pending knowledge suggestion** from that session (prefilled with Aria's last
   reply). An admin edits it into an answer and approves it; the next matching
-  utterance retrieves it (ranked BM25-style search) and adds it to the agent's
-  context. This is retrieval + human review, not fine-tuning — so it stays
-  explainable and ₹0.
+  utterance retrieves it and adds it to the agent's grounded context.
+- **Fine-tune (optional)** — export only the interactions the guardrails already
+  accepted as chat JSONL and feed them to the LoRA pipeline in
+  `scripts/finetune` (see below). Retrieval + human review runs at ₹0 today;
+  fine-tuning is the same loop's offline upgrade.
 
 Knowledge informs *wording only*: tool results and `policy.ts` remain the sole
 source of truth for every decision.
+
+---
+
+## Retrieval-augmented generation (RAG) & fine-tuning
+
+Aria never answers from a wall of hardcoded strings. Her wording is produced at
+runtime from a **company-agnostic knowledge base**, then verified. The stack
+(`src/lib/server/rag/`) has three parts:
+
+1. **Embeddings** (`embed.ts`) — a dependency-free, deterministic hashed
+   bag-of-words + bigram embedder (so it works offline at ₹0), with an automatic
+   upgrade to real dense vectors from a local Ollama model (`nomic-embed-text`)
+   when one is reachable. Both satisfy one `EmbeddingProvider` interface.
+2. **Hybrid retrieval** (`chunk.ts`, `store.ts`, `retrieve.ts`) — documents are
+   split into overlapping, sentence-aligned chunks; an in-memory index serves
+   both **dense cosine** and **Okapi BM25** results, fused with
+   **reciprocal-rank fusion** and nudged by the turn's intent/locale. Top passages
+   are returned with citation ids (`K1`, `K2`, …).
+3. **Tenant corpus** (`corpus.ts`) — everything about *who we are* (brand, agent
+   name, policy/FAQ documents) lives in a `Tenant`. Swap it and the same engine
+   serves any company.
+
+The retrieved passages are injected into the agent prompt with their citations,
+and every factual claim must trace back to a tool result or a passage.
+
+### No hardcoded replies, but no room to invent either
+
+The runtime agent now composes replies in two modes, both verified:
+
+- **Compose** (informational intents: tracking, COD, shipping) — the model writes
+  fresh prose from verified tool results and cited passages.
+- **Paraphrase** (every other intent: returns, cancellations, damage, …) — the
+  deterministic engine still decides; the model only *humanises* the verified
+  decision. The guardrail (`validateDraft`) proves the paraphrase changed no
+  meaning: it rejects any draft that introduces a new order id, courier, tracking
+  reference or number, or that **drops a refusal** (a reply saying a decline
+  succeeded is rejected). On any rejection the engine's verified reply is used.
+
+So the answer can sound human without ever bending policy — and the deterministic
+`policy.ts` remains the single source of truth.
+
+### Fine-tuning (optional, runs where compute exists)
+
+Retrieval decides *what is true*; fine-tuning teaches *how to sound*. The admin
+portal's **Export dataset** button builds chat JSONL from resolved, in-scope
+sessions and approved knowledge — never from rejected or unresolved turns — and
+`scripts/finetune/` turns it into a LoRA adapter (Unsloth + TRL) served through
+Ollama. See `scripts/finetune/README.md`. This is deliberately not run in the
+graded app: it needs a GPU, so it ships as a documented pipeline while retrieval
+does the work today.
 
 ---
 
@@ -337,7 +389,7 @@ npm run dev        # http://localhost:3000
 | `npm run dev` | Start the dev server. |
 | `npm run build` | Production build. |
 | `npm start` | Serve the production build. |
-| `npm test` | Run the Vitest suite (162 tests). |
+| `npm test` | Run the Vitest suite (185 tests). |
 | `npm run test:watch` | Watch mode. |
 | `npm run typecheck` | `tsc --noEmit`. |
 | `npm run lint` | ESLint. |
@@ -357,6 +409,7 @@ deterministic engine. In production you should set `AUTH_SECRET` (see below).
 | `AURA_ENABLE_LOCAL_AI` | Optional | `true` (default) to allow probing the agent path; `false` to disable it entirely. |
 | `OLLAMA_BASE_URL` | Optional | Local Ollama endpoint (default `http://127.0.0.1:11434`). |
 | `OLLAMA_MODEL` | Optional | Model used by the agent (default `llama3.2`). |
+| `OLLAMA_EMBED_MODEL` | Optional | Embedding model for RAG (default `nomic-embed-text`). Falls back to the offline embedder if unavailable. |
 | `MONGODB_URI` | Optional | MongoDB Atlas connection string. When unset, an in-memory store is used. |
 | `MONGODB_DB` | Optional | Database name (default `aura_voice_cx`). |
 | `ADMIN_EMAILS` | Optional | Comma-separated allowlist for `/admin`. Blank closes the portal to everyone. |
@@ -402,7 +455,7 @@ recognition result and never displays an unverified "online" status.
 ## Testing
 
 ```bash
-npm test        # 15 files, 162 tests
+npm test        # 18 files, 185 tests
 ```
 
 Coverage includes the policy engine, scored intent classifier (negation,
@@ -412,9 +465,12 @@ five languages, the voice adapter error mapping, the stateless
 request-repository replay, the persistence repositories (profile, address,
 session and knowledge CRUD with stats and ranked search), admin analytics, the
 six scripted scenarios run through the real engine, the in-app evaluation
-harness, the demo-auth credentials, and the agent's guardrails — including
-rejection of invented order ids / couriers, of drafts that claim a denied action
-succeeded, and verification that approved knowledge reaches the model prompt.
+harness, the demo-auth credentials, the RAG stack (deterministic embeddings,
+chunking, hybrid BM25 + vector retrieval with citations, knowledge ingestion),
+the fine-tuning dataset builder, and the agent's guardrails — including rejection
+of invented order ids / couriers / numbers, of drafts that claim a denied action
+succeeded or drop a refusal, and verification that approved knowledge and cited
+RAG passages reach the model prompt.
 
 ---
 
@@ -448,7 +504,7 @@ src/
 │                            VoiceWorkspace, VoiceOrb, ConversationPanel,
 │                            ActivityTimeline, TestOrdersPanel, ScenarioLauncher,
 │                            PostCallPanel, HistoryPanel, EvaluationPanel,
-│                            Workspace, ui
+│                            DatasetExportPanel, Workspace, ui
 ├── lib/
 │   ├── domain/              types · orders · policy · intent · tools · orchestrator
 │   │                        outcome · transcript · locale · messages
@@ -456,7 +512,11 @@ src/
 │   ├── server/              agent · agentTools · engine (stateless repo replay)
 │   │                        · analytics · evaluation · ollama · validation
 │   │                        · demoAuth · authEnv · adminEnv · userContext
-│   │   └── db/              types · client · repositories (Mongo ↔ in-memory)
+│   │   ├── db/              types · client · repositories (Mongo ↔ in-memory)
+│   │   └── rag/             embed · chunk · store · retrieve · corpus
+│   │                        (hybrid retrieval) · dataset (SFT export) · context
+scripts/
+└── finetune/                train_lora.py · Modelfile · README (optional LoRA)
 │   ├── voice/               adapter · web-speech · mic · mock
 │   └── client/              useCallSession · engineClient · scenarios · labels …
 ```
